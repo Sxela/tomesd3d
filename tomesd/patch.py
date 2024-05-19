@@ -7,14 +7,16 @@ from .utils import isinstance_str, init_generator
 
 
 
-def compute_merge(x: torch.Tensor, tome_info: Dict[str, Any]) -> Tuple[Callable, ...]:
+def compute_merge(x: torch.Tensor, tome_info: Dict[str, Any], metric: torch.Tensor) -> Tuple[Callable, ...]:
     original_h, original_w = tome_info["size"]
+    original_d = tome_info["depth"]
     original_tokens = original_h * original_w
     downsample = int(math.ceil(math.sqrt(original_tokens // x.shape[1])))
 
     args = tome_info["args"]
 
-    if downsample <= args["max_downsample"]:
+    if (downsample <= args["max_downsample"]) and metric is not None:
+        # print('compute_merge use metric')
         w = int(math.ceil(original_w / downsample))
         h = int(math.ceil(original_h / downsample))
         r = int(x.shape[1] * args["ratio"])
@@ -28,9 +30,10 @@ def compute_merge(x: torch.Tensor, tome_info: Dict[str, Any]) -> Tuple[Callable,
         # If the batch size is odd, then it's not possible for prompted and unprompted images to be in the same
         # batch, which causes artifacts with use_rand, so force it to be off.
         use_rand = False if x.shape[0] % 2 == 1 else args["use_rand"]
-        m, u = merge.bipartite_soft_matching_random2d(x, w, h, args["sx"], args["sy"], r, 
+        m, u = merge.bipartite_soft_matching_random2d(metric, w, h, args["sx"], args["sy"], r, d=original_d, sz=args["sz"],
                                                       no_rand=not use_rand, generator=args["generator"])
     else:
+        # print('compute_merge set/skip metric')
         m, u = (merge.do_nothing, merge.do_nothing)
 
     m_a, u_a = (m, u) if args["merge_attn"]      else (merge.do_nothing, merge.do_nothing)
@@ -54,14 +57,36 @@ def make_tome_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]
     class ToMeBlock(block_class):
         # Save for unpatching later
         _parent = block_class
-
+        metric = None
+        
         def _forward(self, x: torch.Tensor, context: torch.Tensor = None) -> torch.Tensor:
-            m_a, m_c, m_m, u_a, u_c, u_m = compute_merge(x, self._tome_info)
+            model = self._tome_info['model']
+            if model.save_metric:
+              #save metric but don't apply tome 
+              self.metric = x
+              metric = None
+              
+              if model.verbose:print('tomeblock set metric')
+            elif model.use_x_metric: 
+              if model.verbose:print('tomeblock x metric')
+              metric = x
+            else:
+              #use saved metric, apply tome
+              assert self.metric is not None, 'To use external metric you need to run model forward first to store the metric.'
+              metric = self.metric
+              if model.verbose:print('tomeblock use metric')
+
+            m_a, m_c, m_m, u_a, u_c, u_m = compute_merge(x, self._tome_info, metric)
 
             # This is where the meat of the computation happens
             x = u_a(self.attn1(m_a(self.norm1(x)), context=context if self.disable_self_attn else None)) + x
-            x = u_c(self.attn2(m_c(self.norm2(x)), context=context)) + x
-            x = u_m(self.ff(m_m(self.norm3(x)))) + x
+            if model.vidtome_attn: 
+                if model.verbose:print('vidtome style attn')
+                x = (self.attn2((self.norm2(x)), context=context)) + x
+                x = (self.ff((self.norm3(x)))) + x
+            else: 
+                x = u_c(self.attn2(m_c(self.norm2(x)), context=context)) + x
+                x = u_m(self.ff(m_m(self.norm3(x)))) + x
 
             return x
     
@@ -166,7 +191,9 @@ def make_diffusers_tome_block(block_class: Type[torch.nn.Module]) -> Type[torch.
 def hook_tome_model(model: torch.nn.Module):
     """ Adds a forward pre hook to get the image size. This hook can be removed with remove_patch. """
     def hook(module, args):
-        module._tome_info["size"] = (args[0].shape[2], args[0].shape[3])
+        # print('args', args)
+        # print('module', module)
+        # module._tome_info["size"] = (args[0].shape[2], args[0].shape[3])
         return None
 
     model._tome_info["hooks"].append(model.register_forward_pre_hook(hook))
@@ -182,11 +209,13 @@ def apply_patch(
         model: torch.nn.Module,
         ratio: float = 0.5,
         max_downsample: int = 1,
-        sx: int = 2, sy: int = 2,
+        sx: int = 2, sy: int = 2, sz: int = 1,
         use_rand: bool = True,
         merge_attn: bool = True,
         merge_crossattn: bool = False,
-        merge_mlp: bool = False):
+        merge_mlp: bool = False,
+        size = None,
+        depth = 1):
     """
     Patches a stable diffusion model with ToMe.
     Apply this to the highest level stable diffusion object (i.e., it should have a .model.diffusion_model).
@@ -225,12 +254,14 @@ def apply_patch(
         diffusion_model = model.unet if hasattr(model, "unet") else model
 
     diffusion_model._tome_info = {
-        "size": None,
+        "size": size,
+        "depth": depth,
         "hooks": [],
         "args": {
             "ratio": ratio,
             "max_downsample": max_downsample,
             "sx": sx, "sy": sy,
+            "sz": sz,
             "use_rand": use_rand,
             "generator": None,
             "merge_attn": merge_attn,
